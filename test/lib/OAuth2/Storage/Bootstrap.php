@@ -4,13 +4,14 @@ namespace OAuth2\Storage;
 
 class Bootstrap
 {
-    const DYNAMODB_PHP_VERSION = '5.5';
+    const DYNAMODB_PHP_VERSION = 'none';
 
     protected static $instance;
     private $mysql;
     private $sqlite;
     private $postgres;
     private $mongo;
+    private $mongoDb;
     private $redis;
     private $cassandra;
     private $configDir;
@@ -137,13 +138,12 @@ class Bootstrap
     public function getMongo()
     {
         if (!$this->mongo) {
-            $skipMongo = $this->getEnvVar('SKIP_MONGO_TESTS');
-            if (!$skipMongo && class_exists('MongoClient')) {
+            if (class_exists('MongoClient')) {
                 $mongo = new \MongoClient('mongodb://localhost:27017', array('connect' => false));
                 if ($this->testMongoConnection($mongo)) {
-                    $db = $mongo->oauth2_server_php;
-                    $this->removeMongoDb($db);
-                    $this->createMongoDb($db);
+                    $db = $mongo->oauth2_server_php_legacy;
+                    $this->removeMongo($db);
+                    $this->createMongo($db);
 
                     $this->mongo = new Mongo($db);
                 } else {
@@ -157,6 +157,28 @@ class Bootstrap
         return $this->mongo;
     }
 
+    public function getMongoDb()
+    {
+        if (!$this->mongoDb) {
+            if (class_exists('MongoDB\Client')) {
+                $mongoDb = new \MongoDB\Client('mongodb://localhost:27017');
+                if ($this->testMongoDBConnection($mongoDb)) {
+                    $db = $mongoDb->oauth2_server_php;
+                    $this->removeMongoDb($db);
+                    $this->createMongoDb($db);
+
+                    $this->mongoDb = new MongoDB($db);
+                } else {
+                    $this->mongoDb = new NullStorage('MongoDB', 'Unable to connect to mongo server on "localhost:27017"');
+                }
+            } else {
+                $this->mongoDb = new NullStorage('MongoDB', 'Missing MongoDB php extension. Please install mongodb.so');
+            }
+        }
+
+        return $this->mongoDb;
+    }
+
     private function testMongoConnection(\MongoClient $mongo)
     {
         try {
@@ -168,23 +190,37 @@ class Bootstrap
         return true;
     }
 
+    private function testMongoDBConnection(\MongoDB\Client $mongo)
+    {
+        return true;
+    }
+
     public function getCouchbase()
     {
         if (!$this->couchbase) {
-            $skipCouchbase = $this->getEnvVar('SKIP_COUCHBASE_TESTS');
-            if (!$skipCouchbase && class_exists('Couchbase')) {
-
-                $couchbase = new \Couchbase(array('localhost:8091'), '', '', 'auth', false);
-                if ($this->testCouchbaseConnection($couchbase)) {
-                    $this->clearCouchbase($couchbase);
-                    $this->createCouchbaseDB($couchbase);
-
-                    $this->couchbase = new CouchbaseDB($couchbase);
-                } else {
-                    $this->couchbase = new NullStorage('Couchbase', 'Unable to connect to Couchbase server on "localhost:8091"');
-                }
-            } else {
+            if ($this->getEnvVar('SKIP_COUCHBASE_TESTS')) {
+                $this->couchbase = new NullStorage('Couchbase', 'Skipping Couchbase tests');
+            } elseif (!class_exists('Couchbase')) {
                 $this->couchbase = new NullStorage('Couchbase', 'Missing Couchbase php extension. Please install couchbase.so');
+            } else {
+                // round-about way to make sure couchbase is working
+                // this is required because it throws a "floating point exception" otherwise
+                $code = "new \Couchbase(array('localhost:8091'), '', '', 'auth', false);";
+                $exec = sprintf('php -r "%s"', $code);
+                $ret = exec($exec, $test, $var);
+                if ($ret != 0) {
+                    $couchbase = new \Couchbase(array('localhost:8091'), '', '', 'auth', false);
+                    if ($this->testCouchbaseConnection($couchbase)) {
+                        $this->clearCouchbase($couchbase);
+                        $this->createCouchbaseDB($couchbase);
+
+                        $this->couchbase = new CouchbaseDB($couchbase);
+                    } else {
+                        $this->couchbase = new NullStorage('Couchbase', 'Unable to connect to Couchbase server on "localhost:8091"');
+                    }
+                } else {
+                    $this->couchbase = new NullStorage('Couchbase', 'Error while trying to connect to Couchbase');
+                }
             }
         }
 
@@ -203,7 +239,6 @@ class Bootstrap
 
         return true;
     }
-
 
     public function getCassandraStorage()
     {
@@ -258,12 +293,13 @@ class Bootstrap
         ));
 
         $sys->create_column_family('oauth2_test', 'auth');
+        $cassandra = new \phpcassa\Connection\ConnectionPool('oauth2_test', array('127.0.0.1:9160'));
+        $cf = new \phpcassa\ColumnFamily($cassandra, 'auth');
 
         // populate the data
         $storage->setClientDetails("oauth_test_client", "testpass", "http://example.com", 'implicit password');
         $storage->setAccessToken("testtoken", "Some Client", '', time() + 1000);
         $storage->setAuthorizationCode("testcode", "Some Client", '', '', time() + 1000);
-        $storage->setUser("testuser", "password");
 
         $storage->setScope('supportedscope1 supportedscope2 supportedscope3 supportedscope4');
         $storage->setScope('defaultscope1 defaultscope2', null, 'default');
@@ -281,6 +317,13 @@ class Bootstrap
         $storage->setScope('clientscope3', 'Test Default Scope Client ID 2', 'default');
 
         $storage->setClientKey('oauth_test_client', $this->getTestPublicKey(), 'test_subject');
+
+        $cf->insert("oauth_public_keys:ClientID_One", array('__data' => json_encode(array("public_key" => "client_1_public", "private_key" => "client_1_private", "encryption_algorithm" => "RS256"))));
+        $cf->insert("oauth_public_keys:ClientID_Two", array('__data' => json_encode(array("public_key" => "client_2_public", "private_key" => "client_2_private", "encryption_algorithm" => "RS256"))));
+        $cf->insert("oauth_public_keys:", array('__data' => json_encode(array("public_key" => $this->getTestPublicKey(), "private_key" =>  $this->getTestPrivateKey(), "encryption_algorithm" => "RS256"))));
+
+        $cf->insert("oauth_users:testuser", array('__data' =>json_encode(array("password" => "password", "email" => "testuser@test.com", "email_verified" => true))));
+
     }
 
     private function createSqliteDb(\PDO $pdo)
@@ -309,6 +352,10 @@ class Bootstrap
 
     private function createPostgresDb()
     {
+        if (!`psql postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='postgres'"`) {
+            `createuser -s -r postgres`;
+        }
+
         `createdb -O postgres oauth2_server_php`;
     }
 
@@ -319,7 +366,9 @@ class Bootstrap
 
     private function removePostgresDb()
     {
-        `dropdb oauth2_server_php`;
+        if (trim(`psql -l | grep oauth2_server_php | wc -l`)) {
+            `dropdb oauth2_server_php`;
+        }
     }
 
     public function runPdoSql(\PDO $pdo)
@@ -379,9 +428,8 @@ class Bootstrap
         return $this->configDir;
     }
 
-
-    private function createCouchbaseDB(\Couchbase $db) {
-
+    private function createCouchbaseDB(\Couchbase $db)
+    {
         $db->set('oauth_clients-oauth_test_client',json_encode(array(
             'client_id' => "oauth_test_client",
             'client_secret' => "testpass",
@@ -400,8 +448,10 @@ class Bootstrap
         )));
 
         $db->set('oauth_users-testuser',json_encode(array(
-            'username' => "testuser",
-            'password' => "password"
+            'username' => 'testuser',
+            'password' => 'password',
+            'email' => 'testuser@test.com',
+            'email_verified' => true,
         )));
 
         $db->set('oauth_jwt-oauth_test_client',json_encode(array(
@@ -411,14 +461,15 @@ class Bootstrap
         )));
     }
 
-    private function clearCouchbase(\Couchbase $cb) {
+    private function clearCouchbase(\Couchbase $cb)
+    {
         $cb->delete('oauth_authorization_codes-new-openid-code');
         $cb->delete('oauth_access_tokens-newtoken');
         $cb->delete('oauth_authorization_codes-newcode');
         $cb->delete('oauth_refresh_tokens-refreshtoken');
     }
 
-    private function createMongoDb(\MongoDB $db)
+    private function createMongo(\MongoDB $db)
     {
         $db->oauth_clients->insert(array(
             'client_id' => "oauth_test_client",
@@ -438,15 +489,74 @@ class Bootstrap
         ));
 
         $db->oauth_users->insert(array(
-            'username' => "testuser",
-            'password' => "password"
+            'username' => 'testuser',
+            'password' => 'password',
+            'email' => 'testuser@test.com',
+            'email_verified' => true,
+        ));
+
+        $db->oauth_keys->insert(array(
+            'client_id'   => null,
+            'public_key' => $this->getTestPublicKey(),
+            'private_key' => $this->getTestPrivateKey(),
+            'encryption_algorithm' => 'RS256'
         ));
 
         $db->oauth_jwt->insert(array(
             'client_id' => 'oauth_test_client',
-            'key'       => $this->getTestPublicKey(),
+            'key' => $this->getTestPublicKey(),
             'subject'   => 'test_subject',
         ));
+    }
+
+    public function removeMongo(\MongoDB $db)
+    {
+        $db->drop();
+    }
+
+    private function createMongoDB(\MongoDB\Database $db)
+    {
+        $db->oauth_clients->insertOne(array(
+            'client_id' => "oauth_test_client",
+            'client_secret' => "testpass",
+            'redirect_uri' => "http://example.com",
+            'grant_types' => 'implicit password'
+        ));
+
+        $db->oauth_access_tokens->insertOne(array(
+            'access_token' => "testtoken",
+            'client_id' => "Some Client"
+        ));
+
+        $db->oauth_authorization_codes->insertOne(array(
+            'authorization_code' => "testcode",
+            'client_id' => "Some Client"
+        ));
+
+        $db->oauth_users->insertOne(array(
+            'username' => 'testuser',
+            'password' => 'password',
+            'email' => 'testuser@test.com',
+            'email_verified' => true,
+        ));
+
+        $db->oauth_keys->insertOne(array(
+            'client_id'   => null,
+            'public_key' => $this->getTestPublicKey(),
+            'private_key' => $this->getTestPrivateKey(),
+            'encryption_algorithm' => 'RS256'
+        ));
+
+        $db->oauth_jwt->insertOne(array(
+            'client_id' => 'oauth_test_client',
+            'key' => $this->getTestPublicKey(),
+            'subject'   => 'test_subject',
+        ));
+    }
+
+    public function removeMongoDB(\MongoDB\Database $db)
+    {
+        $db->drop();
     }
 
     private function createRedisDb(Redis $storage)
@@ -472,11 +582,6 @@ class Bootstrap
         $storage->setScope('clientscope3', 'Test Default Scope Client ID 2', 'default');
 
         $storage->setClientKey('oauth_test_client', $this->getTestPublicKey(), 'test_subject');
-    }
-
-    public function removeMongoDb(\MongoDB $db)
-    {
-        $db->drop();
     }
 
     public function getTestPublicKey()
